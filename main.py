@@ -4,7 +4,6 @@ from typing import List, Optional
 from datetime import datetime
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Float
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
-# NUEVO: Importamos AsyncMacLookup para que no choque con FastAPI
 from mac_vendor_lookup import AsyncMacLookup, VendorNotFoundError 
 
 # --- CONFIGURACIÓN DE BASE DE DATOS (SQLite) ---
@@ -35,7 +34,7 @@ Base.metadata.create_all(bind=engine)
 
 # --- INICIALIZACIÓN ---
 app = FastAPI(title="Network Security API")
-mac_lookup = AsyncMacLookup() # Versión asíncrona segura
+mac_lookup = AsyncMacLookup()
 
 def get_db():
     db = SessionLocal()
@@ -44,11 +43,10 @@ def get_db():
     finally:
         db.close()
 
-# Evento de inicio seguro
 @app.on_event("startup")
 async def startup_event():
     try:
-        await mac_lookup.update_vendors() # Añadimos await
+        await mac_lookup.update_vendors()
         print("Base de datos OUI actualizada.")
     except Exception as e:
         print(f"Error al actualizar OUI: {e}")
@@ -71,6 +69,7 @@ class PortAnalysis(BaseModel):
 class DeviceAnalysisResponse(BaseModel):
     ip_address: str
     security_score: int
+    device_type: str  # Campo para identificar el tipo de dispositivo
     port_analysis: List[PortAnalysis]
 
 class WifiSignalPoint(BaseModel):
@@ -84,10 +83,9 @@ class WifiSignalPoint(BaseModel):
 async def detect_device(device: DeviceDetectRequest, db: Session = Depends(get_db)):
     fabricante_real = "Desconocido"
     try:
-        # Añadimos await para no bloquear el Event Loop
         fabricante_real = await mac_lookup.lookup(device.mac_address)
     except Exception:
-        pass # Si la MAC es un hash simulado, pasará por aquí
+        pass 
 
     db_device = db.query(DeviceDB).filter(DeviceDB.mac_address == device.mac_address).first()
     is_intruder = False
@@ -123,16 +121,23 @@ async def detect_device(device: DeviceDetectRequest, db: Session = Depends(get_d
 @app.post("/api/v1/analyze-device", response_model=DeviceAnalysisResponse)
 async def analyze_device(device: DeviceScanRequest):
     KNOWN_PORTS = {
-        21: {"service": "FTP", "risk": "Alto", "rec": "Puerto no cifrado. Desactívalo."},
+        21: {"service": "FTP", "risk": "Alto", "rec": "Puerto no cifrado. Desactívalo si no es un NAS."},
         22: {"service": "SSH", "risk": "Medio", "rec": "Revisa contraseñas por defecto."},
+        53: {"service": "DNS", "risk": "Bajo", "rec": "Servicio de resolución (Común en Routers)."},
         80: {"service": "HTTP", "risk": "Medio", "rec": "Tráfico web no seguro."},
         443: {"service": "HTTPS", "risk": "Bajo", "rec": "Conexión cifrada estándar."},
-        554: {"service": "RTSP", "risk": "Alto", "rec": "Cámara IP detectada."},
-        8080: {"service": "HTTP-Alt", "risk": "Medio", "rec": "Servicio de router/IoT."}
+        445: {"service": "SMB", "risk": "Alto", "rec": "Riesgo de Ransomware. Cierra si no compartes archivos."},
+        554: {"service": "RTSP", "risk": "Alto", "rec": "Transmisión de video. Posible cámara IP o DVR."},
+        5000: {"service": "UPnP", "risk": "Medio", "rec": "Servicio de descubrimiento."},
+        8008: {"service": "HTTP-Cast", "risk": "Bajo", "rec": "Puerto de transmisión (Chromecast/Smart TV)."},
+        8080: {"service": "HTTP-Alt", "risk": "Medio", "rec": "Común en paneles de administración."},
+        62078: {"service": "Apple Sync", "risk": "Bajo", "rec": "Sincronización de dispositivos Apple."}
     }
     
     analysis_results = []
     score = 100
+    device_type = "Dispositivo Genérico (Móvil / PC)"
+
     for port in device.open_ports:
         if port in KNOWN_PORTS:
             p = KNOWN_PORTS[port]
@@ -140,10 +145,33 @@ async def analyze_device(device: DeviceScanRequest):
             if p["risk"] == "Alto": score -= 30
             elif p["risk"] == "Medio": score -= 10
         else:
-            analysis_results.append(PortAnalysis(port=port, service="Desconocido", risk_level="Desconocido", recommendation="Analizar uso."))
+            analysis_results.append(PortAnalysis(port=port, service="Desconocido", risk_level="Desconocido", recommendation="Puerto no estándar. Analizar tráfico."))
             score -= 5
+
+    # Fingerprinting: Adivinar dispositivo por puertos
+    ports_set = set(device.open_ports)
+    
+    if 554 in ports_set:
+        device_type = "📹 Cámara IP / Sistema de Seguridad"
+    elif 8008 in ports_set or 8009 in ports_set:
+        device_type = "📺 Smart TV / Google Chromecast"
+    elif 62078 in ports_set:
+        device_type = "🍎 Dispositivo Apple (iPhone/iPad/Mac)"
+    elif 53 in ports_set and 80 in ports_set:
+        device_type = "🌐 Router / Gateway Principal"
+    elif 445 in ports_set and 139 in ports_set:
+        device_type = "📁 Servidor de Archivos / NAS / Windows PC"
+    elif 21 in ports_set or 22 in ports_set:
+        device_type = "🖥️ Servidor / Linux Host"
+    elif not device.open_ports:
+        device_type = "📱 Smartphone / Dispositivo Oculto"
             
-    return DeviceAnalysisResponse(ip_address=device.ip_address, security_score=max(0, score), port_analysis=analysis_results)
+    return DeviceAnalysisResponse(
+        ip_address=device.ip_address, 
+        security_score=max(0, score), 
+        device_type=device_type, 
+        port_analysis=analysis_results
+    )
 
 # --- ENDPOINTS 3 y 4: Mapa Wi-Fi (WifiMapScreen) ---
 @app.post("/api/v1/wifi-map/record")
@@ -152,7 +180,7 @@ async def record_wifi_signal(point: WifiSignalPoint, db: Session = Depends(get_d
     db.add(new_point)
     db.commit()
     router_rec = "Señal estable."
-    if point.signal_dbm < -80: router_rec = f"Señal muy débil en {point.zone_name}. Usa repetidor."
+    if point.signal_dbm < -80: router_rec = f"Señal débil ({point.signal_dbm} dBm) en {point.zone_name}. Usa repetidor."
     return {"status": "recorded", "recommendation": router_rec}
 
 @app.get("/api/v1/wifi-map/data")
